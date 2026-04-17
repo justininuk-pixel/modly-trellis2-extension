@@ -1,32 +1,10 @@
-"""
-TRELLIS.2 extension for Modly.
-
-Reference : https://huggingface.co/microsoft/TRELLIS.2-4B
-GitHub    : https://github.com/microsoft/TRELLIS.2
-
-All runtime pure-Python dependencies (easydict, plyfile, einops, trellis2
-source) are bundled in vendor/ — no pip install, no internet required at
-runtime.
-
-The following compiled CUDA extensions must be pre-installed in the app's venv
-(they have C++/CUDA components and cannot be vendored as pure Python):
-    o-voxel        — core O-Voxel representation library
-    nvdiffrast     — differentiable rasterizer (NVlabs)
-    nvdiffrec      — PBR renderer (JeffreyXiang fork)
-    cumesh         — CUDA mesh utilities
-    flexgemm       — Triton sparse convolution
-    flash-attn     — fused attention (or: xformers as fallback)
-
-To rebuild vendor/:
-    python build_vendor.py   (run once with the app's venv active)
-"""
-
 import io
 import os
 import sys
 import time
 import threading
 import uuid
+import traceback
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -43,10 +21,6 @@ class Trellis2Generator(BaseGenerator):
     DISPLAY_NAME = "TRELLIS.2"
     VRAM_GB      = 24
 
-    # ------------------------------------------------------------------ #
-    # Lifecycle
-    # ------------------------------------------------------------------ #
-
     def is_downloaded(self) -> bool:
         return (self.model_dir / "pipeline.json").exists()
 
@@ -57,24 +31,28 @@ class Trellis2Generator(BaseGenerator):
         if not self.is_downloaded():
             self._auto_download()
 
-        self._setup_env()    # must run before vendor imports so SPARSE_CONV_BACKEND is set
+        self._setup_env()
         self._setup_vendor()
 
-        from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        try:
+            from trellis2.pipelines import Trellis2ImageTo3DPipeline
+        except ImportError as e:
+            raise RuntimeError(f"[TRELLIS] Failed to import pipeline: {e}")
 
-        print(f"[Trellis2Generator] Loading model from {self.model_dir}...")
-        pipe = Trellis2ImageTo3DPipeline.from_pretrained(str(self.model_dir))
-        pipe.cuda()
+        print(f"[TRELLIS] Loading model from {self.model_dir}...")
+
+        try:
+            pipe = Trellis2ImageTo3DPipeline.from_pretrained(str(self.model_dir))
+            pipe.cuda()
+        except Exception as e:
+            traceback.print_exc()
+            raise RuntimeError(f"[TRELLIS] Model load failed: {e}")
 
         self._model = pipe
-        print("[Trellis2Generator] Loaded on CUDA.")
+        print("[TRELLIS] Model loaded successfully.")
 
     def unload(self) -> None:
         super().unload()
-
-    # ------------------------------------------------------------------ #
-    # Inference
-    # ------------------------------------------------------------------ #
 
     def generate(
         self,
@@ -83,8 +61,37 @@ class Trellis2Generator(BaseGenerator):
         progress_cb: Optional[Callable[[int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Path:
-        import o_voxel
+        try:
+            return self._generate_impl(image_bytes, params, progress_cb, cancel_event)
+        except GenerationCancelled:
+            raise
+        except Exception as e:
+            traceback.print_exc()
+            raise RuntimeError(f"TRELLIS failed: {str(e)}")
 
+    def _generate_impl(
+        self,
+        image_bytes: bytes,
+        params: dict,
+        progress_cb,
+        cancel_event,
+    ) -> Path:
+
+        # Ensure model is loaded
+        if self._model is None:
+            self.load()
+
+        # Safe dependency import
+        try:
+            import o_voxel
+        except ImportError as e:
+            raise RuntimeError(f"Missing dependency: {e}")
+
+        # Validate input
+        if not image_bytes:
+            raise ValueError("No image data received")
+
+        # Params
         pipeline_type = params.get("pipeline_type", "1024_cascade")
         sparse_steps  = int(params.get("sparse_steps", 12))
         shape_steps   = int(params.get("shape_steps", 12))
@@ -95,12 +102,24 @@ class Trellis2Generator(BaseGenerator):
 
         target_faces = faces if faces > 0 else 1_000_000
 
+        print("[TRELLIS] Params:", {
+            "pipeline_type": pipeline_type,
+            "sparse_steps": sparse_steps,
+            "shape_steps": shape_steps,
+            "tex_steps": tex_steps,
+            "seed": seed
+        })
+
         # Load image
         self._report(progress_cb, 5, "Loading image...")
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        try:
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        except Exception as e:
+            raise RuntimeError(f"Invalid image input: {e}")
+
         self._check_cancelled(cancel_event)
 
-        # Forward pass (three-stage diffusion)
+        # Run model
         self._report(progress_cb, 10, "Generating 3D structure...")
 
         stop_evt = threading.Event()
@@ -122,209 +141,74 @@ class Trellis2Generator(BaseGenerator):
                 shape_slat_sampler_params={"steps": shape_steps},
                 tex_slat_sampler_params={"steps": tex_steps},
             )
+        except Exception as e:
+            traceback.print_exc()
+            raise RuntimeError(f"Pipeline execution failed: {e}")
         finally:
             stop_evt.set()
 
         self._check_cancelled(cancel_event)
 
-        # Simplify mesh (nvdiffrast hard limit: 16,777,216 faces)
+        # Mesh processing
         self._report(progress_cb, 87, "Simplifying mesh...")
-        mesh = outputs[0]
-        mesh.simplify(min(target_faces, 16_777_216))
+
+        try:
+            mesh = outputs[0]
+            mesh.simplify(min(target_faces, 16_777_216))
+        except Exception as e:
+            raise RuntimeError(f"Mesh processing failed: {e}")
 
         self._check_cancelled(cancel_event)
 
-        # Bake PBR textures and export GLB
+        # Export
         self._report(progress_cb, 93, "Baking textures & exporting GLB...")
-        glb = o_voxel.postprocess.to_glb(
-            vertices          = mesh.vertices,
-            faces             = mesh.faces,
-            attr_volume       = mesh.attrs,
-            coords            = mesh.coords,
-            attr_layout       = mesh.layout,
-            voxel_size        = mesh.voxel_size,
-            aabb              = [[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-            decimation_target = target_faces,
-            texture_size      = texture_size,
-            remesh            = True,
-            remesh_band       = 1,
-            remesh_project    = 0,
-            verbose           = False,
-        )
+
+        try:
+            glb = o_voxel.postprocess.to_glb(
+                vertices          = mesh.vertices,
+                faces             = mesh.faces,
+                attr_volume       = mesh.attrs,
+                coords            = mesh.coords,
+                attr_layout       = mesh.layout,
+                voxel_size        = mesh.voxel_size,
+                aabb              = [[-0.5]*3, [0.5]*3],
+                decimation_target = target_faces,
+                texture_size      = texture_size,
+                remesh            = True,
+                remesh_band       = 1,
+                remesh_project    = 0,
+                verbose           = False,
+            )
+        except Exception as e:
+            raise RuntimeError(f"GLB conversion failed: {e}")
 
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
         path = self.outputs_dir / name
-        glb.export(str(path), extension_webp=True)
+
+        try:
+            glb.export(str(path), extension_webp=True)
+        except Exception as e:
+            raise RuntimeError(f"Export failed: {e}")
 
         self._report(progress_cb, 100, "Done")
+        print(f"[TRELLIS] Output saved to {path}")
+
         return path
 
-    # ------------------------------------------------------------------ #
-    # Vendor / env setup
-    # ------------------------------------------------------------------ #
+    # ---------------- ENV SETUP ---------------- #
 
     def _setup_vendor(self) -> None:
         if not _VENDOR_DIR.exists():
-            raise RuntimeError(
-                f"[Trellis2Generator] vendor/ directory not found at {_VENDOR_DIR}.\n"
-                "Run 'python build_vendor.py' from the extension directory to build it."
-            )
+            raise RuntimeError("vendor/ directory missing")
 
-        # Import torch first so it registers its DLL directory on Windows.
-        # Compiled CUDA extensions in vendor/ depend on torch DLLs — without
-        # this, Windows cannot find them even if the path is correct.
-        import torch  # noqa: F401
-
-        # Install large packages that cannot be vendored in git (pre-built wheels,
-        # no compilation required — just a pip download).
-        self._ensure_spconv(torch)
-        self._ensure_opencv()
+        import torch  # ensure DLLs loaded
 
         vendor_str = str(_VENDOR_DIR)
         if vendor_str not in sys.path:
             sys.path.insert(0, vendor_str)
 
-        try:
-            from trellis2.pipelines import Trellis2ImageTo3DPipeline  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                f"[Trellis2Generator] vendor/ is incomplete: {exc}\n"
-                "Re-run 'python build_vendor.py' to rebuild it."
-            ) from exc
-
-    def _ensure_spconv(self, torch) -> None:
-        """Install spconv via pip if not already available (pre-built wheel, no compilation)."""
-        try:
-            import spconv  # noqa: F401
-            return
-        except (ImportError, OSError):
-            pass
-
-        cuda_tag = "cu" + torch.version.cuda.replace(".", "")
-        fallbacks = [cuda_tag, "cu124", "cu122", "cu121", "cu120", "cu118"]
-        seen = []
-        for tag in fallbacks:
-            if tag in seen:
-                continue
-            seen.append(tag)
-            pkg = f"spconv-{tag}"
-            print(f"[Trellis2Generator] Installing {pkg} via pip...")
-            import subprocess
-            result = subprocess.run(
-                [sys.executable, "-m", "pip", "install", pkg],
-                capture_output=True, text=True
-            )
-            if result.returncode == 0:
-                print(f"[Trellis2Generator] {pkg} installed successfully.")
-                return
-        raise RuntimeError(
-            "[Trellis2Generator] Could not install spconv for any CUDA version. "
-            f"Tried: {seen}"
-        )
-
-    def _ensure_opencv(self) -> None:
-        """Install opencv-python via pip if not already available (pre-built wheel)."""
-        try:
-            import cv2  # noqa: F401
-            return
-        except (ImportError, OSError):
-            pass
-
-        print("[Trellis2Generator] Installing opencv-python via pip...")
-        import subprocess
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "opencv-python"],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
-            raise RuntimeError(
-                "[Trellis2Generator] Failed to install opencv-python:\n" + result.stderr
-            )
-        print("[Trellis2Generator] opencv-python installed successfully.")
-
     def _setup_env(self) -> None:
-        """Set environment variables required by TRELLIS.2 before first import."""
         os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-        # flex_gemm is not available on PyPI — use spconv as conv backend instead.
         os.environ.setdefault("SPARSE_CONV_BACKEND", "spconv")
-
-    # ------------------------------------------------------------------ #
-    # UI schema
-    # ------------------------------------------------------------------ #
-
-    @classmethod
-    def params_schema(cls) -> list:
-        return [
-            {
-                "id":      "pipeline_type",
-                "label":   "Resolution",
-                "type":    "select",
-                "options": [
-                    {"value": "512",          "label": "512³  (~3 s)"},
-                    {"value": "1024",         "label": "1024³  (~17 s)"},
-                    {"value": "1024_cascade", "label": "1024³ Cascade (~17 s)"},
-                    {"value": "1536_cascade", "label": "1536³ Cascade (~60 s)"},
-                ],
-                "default": "1024_cascade",
-                "tooltip": "Voxel resolution. Higher = more geometry detail but much slower and more VRAM.",
-            },
-            {
-                "id":      "sparse_steps",
-                "label":   "Sparse Structure Steps",
-                "type":    "int",
-                "default": 12,
-                "min":     1,
-                "max":     50,
-                "tooltip": "Diffusion steps for the sparse structure stage. More steps = better structure.",
-            },
-            {
-                "id":      "shape_steps",
-                "label":   "Shape SLAT Steps",
-                "type":    "int",
-                "default": 12,
-                "min":     1,
-                "max":     50,
-                "tooltip": "Diffusion steps for the shape latent stage. More steps = finer geometry.",
-            },
-            {
-                "id":      "tex_steps",
-                "label":   "Texture SLAT Steps",
-                "type":    "int",
-                "default": 12,
-                "min":     1,
-                "max":     50,
-                "tooltip": "Diffusion steps for the texture latent stage. More steps = sharper textures.",
-            },
-            {
-                "id":      "faces",
-                "label":   "Max Faces",
-                "type":    "int",
-                "default": -1,
-                "min":     -1,
-                "max":     16777216,
-                "tooltip": "Target polygon count after simplification. -1 uses 1,000,000.",
-            },
-            {
-                "id":      "texture_size",
-                "label":   "Texture Size",
-                "type":    "select",
-                "options": [
-                    {"value": 2048, "label": "2048"},
-                    {"value": 4096, "label": "4096"},
-                    {"value": 8192, "label": "8192"},
-                ],
-                "default": 4096,
-                "tooltip": "Resolution of the baked PBR texture atlas (base color, roughness, metallic).",
-            },
-            {
-                "id":      "seed",
-                "label":   "Seed",
-                "type":    "int",
-                "default": 42,
-                "min":     0,
-                "max":     2147483647,
-                "tooltip": "Seed for reproducibility. Click shuffle for a random seed.",
-            },
-        ]
