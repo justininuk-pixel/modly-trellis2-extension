@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from PIL import Image
-
 from services.generators.base import BaseGenerator, smooth_progress, GenerationCancelled
 
 _EXTENSION_DIR = Path(__file__).parent
@@ -37,9 +36,9 @@ class Trellis2Generator(BaseGenerator):
         try:
             from trellis2.pipelines import Trellis2ImageTo3DPipeline
         except ImportError as e:
-            raise RuntimeError(f"[TRELLIS] Failed to import pipeline: {e}")
+            raise RuntimeError(f"[TRELLIS] Import failed: {e}")
 
-        print(f"[TRELLIS] Loading model from {self.model_dir}...")
+        print("[TRELLIS] Loading model...")
 
         try:
             pipe = Trellis2ImageTo3DPipeline.from_pretrained(str(self.model_dir))
@@ -49,49 +48,30 @@ class Trellis2Generator(BaseGenerator):
             raise RuntimeError(f"[TRELLIS] Model load failed: {e}")
 
         self._model = pipe
-        print("[TRELLIS] Model loaded successfully.")
+        print("[TRELLIS] Model loaded.")
 
-    def unload(self) -> None:
-        super().unload()
-
-    def generate(
-        self,
-        image_bytes: bytes,
-        params: dict,
-        progress_cb: Optional[Callable[[int, str], None]] = None,
-        cancel_event: Optional[threading.Event] = None,
-    ) -> Path:
+    def generate(self, image_bytes, params, progress_cb=None, cancel_event=None):
         try:
             return self._generate_impl(image_bytes, params, progress_cb, cancel_event)
         except GenerationCancelled:
             raise
         except Exception as e:
             traceback.print_exc()
-            raise RuntimeError(f"TRELLIS failed: {str(e)}")
+            raise RuntimeError(f"TRELLIS failed: {e}")
 
-    def _generate_impl(
-        self,
-        image_bytes: bytes,
-        params: dict,
-        progress_cb,
-        cancel_event,
-    ) -> Path:
+    def _generate_impl(self, image_bytes, params, progress_cb, cancel_event):
 
-        # Ensure model is loaded
         if self._model is None:
             self.load()
 
-        # Safe dependency import
         try:
             import o_voxel
         except ImportError as e:
             raise RuntimeError(f"Missing dependency: {e}")
 
-        # Validate input
         if not image_bytes:
-            raise ValueError("No image data received")
+            raise ValueError("No image provided")
 
-        # Params
         pipeline_type = params.get("pipeline_type", "1024_cascade")
         sparse_steps  = int(params.get("sparse_steps", 12))
         shape_steps   = int(params.get("shape_steps", 12))
@@ -102,34 +82,25 @@ class Trellis2Generator(BaseGenerator):
 
         target_faces = faces if faces > 0 else 1_000_000
 
-        print("[TRELLIS] Params:", {
-            "pipeline_type": pipeline_type,
-            "sparse_steps": sparse_steps,
-            "shape_steps": shape_steps,
-            "tex_steps": tex_steps,
-            "seed": seed
-        })
+        print("[TRELLIS] Params:", params)
 
-        # Load image
         self._report(progress_cb, 5, "Loading image...")
-        try:
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        except Exception as e:
-            raise RuntimeError(f"Invalid image input: {e}")
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
         self._check_cancelled(cancel_event)
 
-        # Run model
-        self._report(progress_cb, 10, "Generating 3D structure...")
+        self._report(progress_cb, 10, "Generating...")
 
         stop_evt = threading.Event()
+
+        progress_thread = None
         if progress_cb:
-            t = threading.Thread(
+            progress_thread = threading.Thread(
                 target=smooth_progress,
-                args=(progress_cb, 10, 85, "Generating 3D structure...", stop_evt, 5.0),
-                daemon=True,
+                args=(progress_cb, 10, 85, "Generating...", stop_evt, 5.0),
+                daemon=True
             )
-            t.start()
+            progress_thread.start()
 
         try:
             outputs = self._model.run(
@@ -143,72 +114,58 @@ class Trellis2Generator(BaseGenerator):
             )
         except Exception as e:
             traceback.print_exc()
-            raise RuntimeError(f"Pipeline execution failed: {e}")
+            raise RuntimeError(f"Pipeline failed: {e}")
         finally:
             stop_evt.set()
+            if progress_thread:
+                progress_thread.join(timeout=5)
 
         self._check_cancelled(cancel_event)
 
-        # Mesh processing
-        self._report(progress_cb, 87, "Simplifying mesh...")
+        self._report(progress_cb, 87, "Processing mesh...")
 
-        try:
-            mesh = outputs[0]
-            mesh.simplify(min(target_faces, 16_777_216))
-        except Exception as e:
-            raise RuntimeError(f"Mesh processing failed: {e}")
+        mesh = outputs[0]
+        mesh.simplify(min(target_faces, 16_777_216))
 
-        self._check_cancelled(cancel_event)
+        self._report(progress_cb, 93, "Exporting GLB...")
 
-        # Export
-        self._report(progress_cb, 93, "Baking textures & exporting GLB...")
-
-        try:
-            glb = o_voxel.postprocess.to_glb(
-                vertices          = mesh.vertices,
-                faces             = mesh.faces,
-                attr_volume       = mesh.attrs,
-                coords            = mesh.coords,
-                attr_layout       = mesh.layout,
-                voxel_size        = mesh.voxel_size,
-                aabb              = [[-0.5]*3, [0.5]*3],
-                decimation_target = target_faces,
-                texture_size      = texture_size,
-                remesh            = True,
-                remesh_band       = 1,
-                remesh_project    = 0,
-                verbose           = False,
-            )
-        except Exception as e:
-            raise RuntimeError(f"GLB conversion failed: {e}")
+        glb = o_voxel.postprocess.to_glb(
+            vertices          = mesh.vertices,
+            faces             = mesh.faces,
+            attr_volume       = mesh.attrs,
+            coords            = mesh.coords,
+            attr_layout       = mesh.layout,
+            voxel_size        = mesh.voxel_size,
+            aabb              = [[-0.5]*3, [0.5]*3],
+            decimation_target = target_faces,
+            texture_size      = texture_size,
+            remesh            = True,
+            verbose           = False,
+        )
 
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
-        name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
-        path = self.outputs_dir / name
 
-        try:
-            glb.export(str(path), extension_webp=True)
-        except Exception as e:
-            raise RuntimeError(f"Export failed: {e}")
+        filename = f"{int(time.time())}_{uuid.uuid4().hex[:6]}.glb"
+        path = self.outputs_dir / filename
+
+        glb.export(str(path), extension_webp=True)
 
         self._report(progress_cb, 100, "Done")
-        print(f"[TRELLIS] Output saved to {path}")
+        print("[TRELLIS] Saved:", path)
 
         return path
 
-    # ---------------- ENV SETUP ---------------- #
-
-    def _setup_vendor(self) -> None:
+    def _setup_vendor(self):
         if not _VENDOR_DIR.exists():
-            raise RuntimeError("vendor/ directory missing")
+            raise RuntimeError("vendor/ folder missing")
 
-        import torch  # ensure DLLs loaded
+        import torch
 
         vendor_str = str(_VENDOR_DIR)
         if vendor_str not in sys.path:
             sys.path.insert(0, vendor_str)
 
-    def _setup_env(self) -> None:
+    def _setup_env(self):
         os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
         os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
         os.environ.setdefault("SPARSE_CONV_BACKEND", "spconv")
