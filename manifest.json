@@ -1,52 +1,43 @@
 {
   "id": "trellis-2",
   "name": "TRELLIS.2",
-  "source": "https://github.com/microsoft/TRELLIS.2",
-  "description": "High-fidelity image-to-3D with PBR textures via O-Voxel structured latents. Generates geometry + full PBR material. Requires ~24GB VRAM.",
-  "version": "1.0.0",
-  "author": "Lightning Pixel",
   "type": "model",
+  "version": "1.0.1",
+  "author": "Lightning Pixel (fixed)",
+  "source": "https://github.com/microsoft/TRELLIS.2",
+  "description": "High-fidelity image-to-3D with PBR textures via O-Voxel structured latents. Generates GLB with full PBR materials.",
+  
   "generator_class": "Trellis2Generator",
+
   "tags": [
     "image-to-3d",
     "high-quality",
     "pbr",
     "diffusion"
   ],
+
   "nodes": [
     {
-      "id": "trellis-2",
-      "name": "TRELLIS.2-4B",
+      "id": "trellis-2-node",
+      "name": "TRELLIS.2 Generator",
       "input": "image",
-      "output": "mesh",
-      "hf_repo": "microsoft/TRELLIS.2-4B",
-      "download_check": "pipeline.json",
-      "description": "4B-parameter O-Voxel diffusion model for high-fidelity image-to-3D with PBR textures (~24GB VRAM)",
+      "output": "file",
+
+      "description": "Generate a textured 3D model (GLB) from a single image using TRELLIS.2",
+
       "params_schema": [
         {
           "id": "pipeline_type",
           "label": "Resolution",
           "type": "select",
           "options": [
-            {
-              "value": "512",
-              "label": "512³  (~3 s)"
-            },
-            {
-              "value": "1024",
-              "label": "1024³  (~17 s)"
-            },
-            {
-              "value": "1024_cascade",
-              "label": "1024³ Cascade (~17 s)"
-            },
-            {
-              "value": "1536_cascade",
-              "label": "1536³ Cascade (~60 s)"
-            }
+            { "value": "512", "label": "512³ (fastest)" },
+            { "value": "1024", "label": "1024³" },
+            { "value": "1024_cascade", "label": "1024³ Cascade (recommended)" },
+            { "value": "1536_cascade", "label": "1536³ Cascade (slow)" }
           ],
           "default": "1024_cascade",
-          "tooltip": "Voxel resolution. Higher = more geometry detail but much slower and more VRAM."
+          "tooltip": "Voxel resolution. Higher = more detail but more VRAM and time."
         },
         {
           "id": "sparse_steps",
@@ -54,26 +45,23 @@
           "type": "int",
           "default": 12,
           "min": 1,
-          "max": 50,
-          "tooltip": "Diffusion steps for the sparse structure stage. More steps = better structure."
+          "max": 50
         },
         {
           "id": "shape_steps",
-          "label": "Shape SLAT Steps",
+          "label": "Shape Steps",
           "type": "int",
           "default": 12,
           "min": 1,
-          "max": 50,
-          "tooltip": "Diffusion steps for the shape latent stage. More steps = finer geometry."
+          "max": 50
         },
         {
           "id": "tex_steps",
-          "label": "Texture SLAT Steps",
+          "label": "Texture Steps",
           "type": "int",
           "default": 12,
           "min": 1,
-          "max": 50,
-          "tooltip": "Diffusion steps for the texture latent stage. More steps = sharper textures."
+          "max": 50
         },
         {
           "id": "faces",
@@ -81,29 +69,18 @@
           "type": "int",
           "default": -1,
           "min": -1,
-          "max": 16777216,
-          "tooltip": "Target polygon count after simplification. -1 uses 1,000,000."
+          "max": 16777216
         },
         {
           "id": "texture_size",
           "label": "Texture Size",
           "type": "select",
           "options": [
-            {
-              "value": 2048,
-              "label": "2048"
-            },
-            {
-              "value": 4096,
-              "label": "4096"
-            },
-            {
-              "value": 8192,
-              "label": "8192"
-            }
+            { "value": 2048, "label": "2048" },
+            { "value": 4096, "label": "4096" },
+            { "value": 8192, "label": "8192" }
           ],
-          "default": 4096,
-          "tooltip": "Resolution of the baked PBR texture atlas (base color, roughness, metallic)."
+          "default": 4096
         },
         {
           "id": "seed",
@@ -111,20 +88,21 @@
           "type": "int",
           "default": 42,
           "min": 0,
-          "max": 2147483647,
-          "tooltip": "Seed for reproducibility. Click shuffle for a random seed."
+          "max": 2147483647
         }
       ]
     }
   ],
+
   "models": [
     {
-      "id": "trellis-2",
+      "id": "trellis-2-4b",
       "name": "TRELLIS.2-4B",
       "hf_repo": "microsoft/TRELLIS.2-4B",
       "download_check": "pipeline.json",
-      "description": "4B-parameter O-Voxel diffusion model for high-fidelity image-to-3D with PBR textures (~24GB VRAM)"
+      "description": "4B-parameter O-Voxel diffusion model for high-fidelity image-to-3D"
     }
   ],
+
   "signature": "BYa3IuqxLgLlMG/mw7x/Un2kLa05qt3e2DrXSoemCMkpB00pMPrIZEp1/A+bMeh1WCkLhUYtWoq2eZufwGK4DQ=="
 }
