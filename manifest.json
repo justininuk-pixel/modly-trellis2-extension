@@ -2,10 +2,19 @@
   "id": "trellis-2",
   "name": "TRELLIS.2",
   "type": "model",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "author": "Lightning Pixel (fixed)",
   "generator_class": "Trellis2Generator",
-  "description": "High-fidelity image-to-3D using TRELLIS.2 (GLB output)",
+  "description": "TRELLIS.2 image-to-3D generator (GLB output)",
+
+  "nodes": [
+    {
+      "id": "trellis-node",
+      "name": "TRELLIS Generator",
+      "input": "image",
+      "output": "file"
+    }
+  ],
 
   "models": [
     {
@@ -14,5 +23,11 @@
       "hf_repo": "microsoft/TRELLIS.2-4B",
       "download_check": "pipeline.json"
     }
+  ],
+
+  "tags": [
+    "image-to-3d",
+    "pbr",
+    "mesh"
   ]
 }
