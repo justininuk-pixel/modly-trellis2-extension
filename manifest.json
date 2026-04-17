@@ -1,7 +1,7 @@
 {
   "id": "trellis-2",
   "name": "TRELLIS.2",
-  "type": "model",
+  "type": "process",
   "version": "1.0.1",
   "author": "Lightning Pixel (fixed)",
   "source": "https://github.com/microsoft/TRELLIS.2",
